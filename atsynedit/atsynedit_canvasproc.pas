@@ -1171,9 +1171,15 @@ begin
     else
     begin
       Inc(Dx.Data[NGapPos-1], NGapWidth);
-      ListInt.Data[0]:= Dx.Data[0];
-      for i:= 1 to ListInt.Len-1 do
-        ListInt.Data[i]:= ListInt.Data[i-1]+Dx.Data[i];
+      //Only positions at and after the gap are affected.
+      //Keep the prefix before the gap unchanged.
+      for i:= NGapPos-1 to ListInt.Len-1 do
+      begin
+        if i=0 then
+          ListInt.Data[i]:= Dx.Data[i]
+        else
+          ListInt.Data[i]:= ListInt.Data[i-1]+Dx.Data[i];
+      end;
     end;
   end
   else
