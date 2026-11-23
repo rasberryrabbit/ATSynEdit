@@ -948,6 +948,11 @@ type
     FPaintCounter: integer;
     FPaintStarted: boolean;
     FPaintWorking: boolean;
+    //One-entry cache for the full logical-line width, reused by wrapped rows
+    //during one DoPaintMain pass only.
+    FPaintWidthCacheValid: boolean;
+    FPaintWidthCacheLine: integer;
+    FPaintWidthCacheValue: Int64;
     FTickMinimap: QWord;
     FTickAll: QWord;
     FShowOsBarVert: boolean;
@@ -3789,6 +3794,9 @@ begin
     FOnDrawEditorBefore(Self, C, FRectMain);
 
   UpdateLinksAttribs(ALineFrom);
+  //The cache is deliberately scoped to this paint pass. This avoids stale
+  //widths after edits, font changes, tab changes, or other editor updates.
+  FPaintWidthCacheValid:= false;
   DoPaintText(C, FRectMain, FCharSize, FOptGutterVisible, FScrollHorz, FScrollVert, NWrapIndex);
   DoPaintMargins(C);
   DoPaintNiceScroll(C);
@@ -4401,13 +4409,27 @@ begin
           if not FFontProportional and StringItem^.HasAsciiNoTabs then
             NOutputMaximalChars:= StringItem^.CharLen
           else
-            NOutputMaximalChars:= CanvasTextWidth(
-              StringItem^.Line, //Line getter is very slow for huge lines
-              NLinesIndex,
-              FTabHelper,
-              1, //pass CharWidth=1px
-              FFontProportional
-              );
+          begin
+            //A logical line may occupy many wrapped screen rows. Its full width
+            //does not change between those rows, so calculate it only once per
+            //paint pass instead of rescanning the same string for every row.
+            if FPaintWidthCacheValid and
+              (FPaintWidthCacheLine=NLinesIndex) then
+              NOutputMaximalChars:= FPaintWidthCacheValue
+            else
+            begin
+              NOutputMaximalChars:= CanvasTextWidth(
+                StringItem^.Line, //Line getter is very slow for huge lines
+                NLinesIndex,
+                FTabHelper,
+                1, //pass CharWidth=1px
+                FFontProportional
+                );
+              FPaintWidthCacheLine:= NLinesIndex;
+              FPaintWidthCacheValue:= NOutputMaximalChars;
+              FPaintWidthCacheValid:= true;
+            end;
+          end;
         end;
         AScrollHorz.NMax:= Max(
           AScrollHorz.NMax,

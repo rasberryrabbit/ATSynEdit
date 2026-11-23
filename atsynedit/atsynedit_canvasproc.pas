@@ -764,7 +764,8 @@ var
   NLen, NSize, ResLen, i: integer;
 begin
   NLen:= Min(Length(S), ATEditorMaxFixedArray);
-  DxOut:= Default(TATInt32FixedArray);
+  //The used entries are written below; clearing the full fixed array is unnecessary.
+  DxOut.Len:= 0;
 
   ResLen:= 0;
   i:= 0;
@@ -1124,8 +1125,10 @@ begin
   NCharWidthScaled:= AProps.CharSize.XScaled;
   NDeltaForItalic:= C.Font.Size * ATEditorOptions.ItalicFontLongerInPercents div 100;
 
-  ListInt:= Default(TATIntFixedArray);
-  Dx:= Default(TATInt32FixedArray);
+  //Only reset logical lengths. Every entry used by this call is overwritten below.
+  //Default(record) would zero the full fixed arrays (about 48 KB) on every call.
+  ListInt.Len:= 0;
+  Dx.Len:= 0;
   //no need to clear DxUTF8
   FillChar(bPartsSpaces, SizeOf(bPartsSpaces), 0);
 
