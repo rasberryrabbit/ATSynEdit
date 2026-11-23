@@ -376,7 +376,8 @@ type
     ScrolledHorz, //flag "horizontal scroll _position_ is changed"
     RepaintNeeded, //last paint changes some state, so repainting is needed
     ScrollEventNeeded, //last paint detected that OnScroll event must be fired
-    Resize //component was resized after last Paint call
+    Resize, //component was resized after last Paint call
+    FixCaretAfterResize //height was decreased, caret line may need scrolling on next paint (CudaText #6608)
     );
   TATEditorInternalFlags = set of TATEditorInternalFlag;
 
@@ -423,6 +424,7 @@ type
     NMax: Int64;
     NPage: Int64;
     NPosLast: Int64;
+    NPixelOffsetLast: Int64; //with gaps, the last position can be into the gaps under line NPosLast
     NPixelOffset: Int64;
     CharSizeScaled: Int64; //char width/height, multiplied by ATEditorCharXScale
     SmoothMax: Int64;
@@ -1240,7 +1242,8 @@ type
       out AColor: TColor; out AColorForced: boolean;
       out AChosenEnum: TATEditorChosenBackColor;
       AHiliteLineWithSelection: boolean);
-    procedure DoCaretsApplyShape(var R: TRect; Props: TATCaretShape; W, H: integer);
+    function DoCaretCalcRect(ACoordX, ACoordY: integer; AShape: TATCaretShape): TRect;
+    function DoCaretGetShape: TATCaretShape;
     function DoCaretApplyProximityToVertEdge(ACaretPos: TPoint; ACaretCoordY: Int64;
       AProximity, AIndentVert: integer): boolean;
     function DoCaretApplyProximityToHorzEdge(ACaretCoordX: Int64;
@@ -1248,6 +1251,9 @@ type
     procedure DoCaretsAddOnColumnBlock(ALineFrom, ALineTo, AColFrom, AColTo: integer;
       ACaretAtLeft: boolean);
     procedure DoCaretsFixForSurrogatePairs(AMoveRight: boolean);
+    procedure DoCaretsFixIfCutAtBottomEdge; //CudaText #6606
+    procedure DoCaretsFixIfHiddenAtBottomEdge; //CudaText #6608
+    function IsLastCaretVisibleVertically: boolean; //CudaText #6608
     function DoCaretsKeepOnScreen(ADirection: TATEditorDirection): boolean;
     procedure DoCaretsAssign(NewCarets: TATCarets);
     procedure DoDropText(AndDeleteSelection: boolean);
@@ -1437,6 +1443,7 @@ type
       AFontSize: integer; AColorFont, AColorBack, AColorBorder: TColor);
     procedure TimerBlinkDisable;
     procedure TimerBlinkEnable;
+    procedure InvalidateRectsOfCarets;
     procedure DoPaintSelectedLineBG(C: TCanvas;
       const ACharSize: TATEditorCharSize;
       const AVisRect: TRect;
@@ -1724,6 +1731,7 @@ type
     property MouseActions: TATEditorMouseActions read FMouseActions write FMouseActions;
     property TabHelper: TATStringTabHelper read FTabHelper;
     property WrapInfo: TATWrapInfo read FWrapInfo;
+    property WrapInfoUpdateNeeded: boolean read FWrapUpdateNeeded write FWrapUpdateNeeded;
     //common
     property ScrollVert: TATEditorScrollInfo read FScrollVert write FScrollVert;
     property ScrollHorz: TATEditorScrollInfo read FScrollHorz write FScrollHorz;
@@ -1785,6 +1793,7 @@ type
     property FileName: string read FFileName write FFileName;
     procedure LoadFromFile(const AFilename: string; AOptions: TATLoadStreamOptions); virtual;
     procedure SaveToFile(const AFilename: string); virtual;
+    procedure SaveToStrings(AList: TStrings);
     //cmd
     procedure TextInsertAtCarets(const AText: atString; AKeepCaret,
       AOvrMode, ASelectThen: boolean);
@@ -2796,7 +2805,11 @@ begin
     (FWrapMode=TATEditorWrapMode.ModeOff) and
     (Fold.Count=0) and
     (NLinesCount>2);
-  if FWrapInfo.VirtualMode then exit;
+  if FWrapInfo.VirtualMode then
+  begin
+    //Random(1); //debug
+    exit;
+  end;
 
   bConsiderFolding:= Fold.Count>0;
   NNewVisibleColumns:= GetVisibleColumns;
@@ -3174,6 +3187,7 @@ var
   bScrolled: boolean;
   NPos, NLineIndex, NGapPos, NGapAll: integer;
   CharSizeScaled_Prev: integer;
+  InfoLast: TATEditorScrollInfo;
 begin
   Result:= false;
 
@@ -3186,6 +3200,9 @@ begin
 
   NGapAll:= 0;
   NGapPos:= 0;
+  //init before the 'if (NPos>NPosLast)' check below: it was read
+  //not-initialized, when no Gaps and not AdjustSmoothPos
+  NPos:= Max(0, FScrollVert.NPos);
 
   //consider Gaps for vertical scrollbar
   if Gaps.Count>0 then
@@ -3193,7 +3210,6 @@ begin
     if AdjustSmoothPos then
     begin
       NLineIndex:= 0;
-      NPos:= Max(0, FScrollVert.NPos);
       if FWrapInfo.IsIndexValid(NPos) then
         NLineIndex:= FWrapInfo.Data[NPos].NLineIndex;
       NGapPos:= GapsSizeForRange(-1, NLineIndex-1);
@@ -3206,18 +3222,34 @@ begin
   with FScrollVert do
   begin
     UpdateScrollInfoVertPartial(NPage, NMax);
-    NPosLast:= Max(0, NMax-NPage);
-    if NPos>NPosLast then
-    begin
-      NPos:= NPosLast; //fix CudaText #4737
-      Include(FPaintFlags, TATEditorInternalFlag.RepaintNeeded); //fix CudaText #5755
-    end;
 
     CharSizeScaled_Prev:= CharSizeScaled;
     CharSizeScaled:= FCharSize.Y * ATEditorCharXScale;
     SmoothMax:= NMax * CharSizeScaled div ATEditorCharXScale + NGapAll;
     SmoothPage:= NPage * CharSizeScaled div ATEditorCharXScale;
     SmoothPosLast:= Max(0, SmoothMax - SmoothPage);
+
+    //the last position: without gaps NMax-NPage lines;
+    //with gaps the one SmoothPosLast is at, which can be lines further and pixels into a gap;
+    //fixes ATSynEdit issue #397
+    NPosLast:= Max(0, NMax-NPage);
+    NPixelOffsetLast:= 0;
+    if (NGapAll>0) and (SmoothPosLast>0) then
+    begin
+      InfoLast:= FScrollVert;
+      InfoLast.SmoothPosLast:= SmoothPosLast+1; //so the conversion does not stop at SetLast
+      UpdateScrollInfoFromSmoothPos(InfoLast, SmoothPosLast);
+      NPosLast:= Max(NPosLast, InfoLast.NPos);
+      if NPosLast=InfoLast.NPos then
+        NPixelOffsetLast:= InfoLast.NPixelOffset;
+    end;
+
+    if (NPos>NPosLast) or ((NGapAll>0) and (NPos=NPosLast) and (NPixelOffset>NPixelOffsetLast)) then
+    begin
+      NPos:= NPosLast; //fix CudaText #4737
+      NPixelOffset:= NPixelOffsetLast;
+      Include(FPaintFlags, TATEditorInternalFlag.RepaintNeeded); //fix CudaText #5755
+    end;
     if AdjustSmoothPos then
       SmoothPos:= TotalOffset + NGapPos
     else
@@ -3313,14 +3345,11 @@ begin
   if FScrollbarVert.Visible then
   begin
     FScrollbarLock:= true;
-
     FScrollbarVert.Min:= 0;
     FScrollbarVert.Max:= FScrollVert.SmoothMax;
     FScrollbarVert.SmallChange:= FScrollVert.CharSizeScaled div ATEditorCharXScale;
     FScrollbarVert.PageSize:= FScrollVert.SmoothPage;
     FScrollbarVert.Position:= FScrollVert.SmoothPos;
-
-    FScrollbarVert.Update;
     FScrollbarLock:= false;
   end;
 
@@ -3371,11 +3400,7 @@ begin
     FScrollbarHorz.SmallChange:= FScrollHorz.CharSizeScaled div ATEditorCharXScale;
     FScrollbarHorz.PageSize:= FScrollHorz.SmoothPage;
     FScrollbarHorz.Position:= FScrollHorz.SmoothPos;
-    FScrollbarHorz.Update;
-    if FScrollbarVert.Visible then
-      FScrollbarHorz.IndentCorner:= 100
-    else
-      FScrollbarHorz.IndentCorner:= 0;
+    FScrollbarHorz.IndentCorner:= IfThen(FScrollbarVert.Visible, 100, 0);
     FScrollbarLock:= false;
   end;
 
@@ -6231,6 +6256,27 @@ begin
   DoEventChange(0, false{AllowOnChange}); //calling OnChange makes almost no sense on opening file
 end;
 
+procedure TATSynEdit.SaveToStrings(AList: TStrings);
+var
+  St: TATStrings;
+  SLine: UnicodeString;
+  i: SizeInt;
+begin
+  St:= Strings;
+
+  AList.BeginUpdate;
+  try
+    AList.Clear;
+    for i:= 0 to St.Count-1 do
+    begin
+      SLine:= St.Lines[i];
+      AList.Add(UTF8Encode(SLine));
+    end;
+  finally
+    AList.EndUpdate;
+  end;
+end;
+
 procedure TATSynEdit.SaveToFile(const AFilename: string);
 var
   St: TATStrings;
@@ -6565,7 +6611,11 @@ begin
 
   Inc(FPaintCounter);
   FVisibleColumns:= GetVisibleColumns;
-  FCaretShown:= false;
+  //CudaText #6635: in buf mode, don't reset the blink phase here;
+  //FCaretShown is owned by TimerBlinkTick, so any number of paint
+  //passes renders the same (correct) caret phase
+  if not DoubleBuffered then
+    FCaretShown:= false;
   Carets.GetSelections(FSel);
 
   if Assigned(FAdapterHilite) then
@@ -6594,6 +6644,68 @@ begin
 end;
 
 
+procedure TATSynEdit.DoCaretsFixIfCutAtBottomEdge;
+//CudaText #6606: client area was changed (scrollbar shown/hidden), and
+//the caret line can be partly cut at the bottom edge, if the caret scroll
+//was calculated for the old client area. Scroll minimally, to fully show
+//the caret line. Don't touch the scroll, if caret line is fully visible
+//or fully invisible (fully invisible means the user scrolled it away).
+var
+  Caret: TATCaretItem;
+begin
+  if Carets.Count=0 then exit;
+  Caret:= Carets[Carets.Count-1];
+  if (Caret.CoordY<FRectMain.Bottom) and
+    (Caret.CoordY+FCharSize.Y>FRectMain.Bottom) then
+    DoGotoCaret(TATCaretEdge.Bottom, false, false, false, false);
+end;
+
+procedure TATSynEdit.DoCaretsFixIfHiddenAtBottomEdge;
+//CudaText #6608: control's height was decreased (e.g. CudaText plugin shows
+//its panel at bottom/top of editor), and the caret line, which was visible
+//before the resize, is now pushed out of the visible area, below the bottom
+//edge (v-scroll-pos was limited for the old bigger height). Scroll minimally,
+//to show the caret line at the bottom edge. Don't touch the scroll, if caret
+//line is still visible (checked by caller: flag is set only if caret line
+//was visible before the resize, so here it's never "user scrolled it away").
+var
+  Caret: TATCaretItem;
+  Coord: TATPoint;
+begin
+  if ModeOneLine then exit;
+  if Carets.Count=0 then exit;
+  if FRectMain=cRectEmpty then exit;
+
+  Caret:= Carets[Carets.Count-1];
+  Coord:= CaretPosToClientPos(Caret.AsPoint);
+  if Coord.Y<0 then exit;
+
+  //caret line is (fully or partly) below the bottom edge,
+  //and it's not above the top edge?
+  if (Coord.Y>=FRectMain.Top) and
+    (Coord.Y+FCharSize.Y>FRectMain.Bottom) then
+  begin
+    DoGotoCaret(TATCaretEdge.Bottom, false, false, false, false);
+    Include(FPaintFlags, TATEditorInternalFlag.RepaintNeeded);
+  end;
+end;
+
+function TATSynEdit.IsLastCaretVisibleVertically: boolean;
+//is the last caret line visible (at least partly) in the current text area?
+var
+  Caret: TATCaretItem;
+  Coord: TATPoint;
+begin
+  Result:= false;
+  if ModeOneLine then exit;
+  if Carets.Count=0 then exit;
+  if FRectMain=cRectEmpty then exit;
+
+  Caret:= Carets[Carets.Count-1];
+  Coord:= CaretPosToClientPos(Caret.AsPoint);
+  Result:= (Coord.Y>=FRectMain.Top) and (Coord.Y<FRectMain.Bottom);
+end;
+
 procedure TATSynEdit.DoPaint(ALineFrom: integer);
 begin
   Exclude(FPaintFlags, TATEditorInternalFlag.RepaintNeeded);
@@ -6619,7 +6731,27 @@ begin
     DoPaintAll(Canvas, ALineFrom);
 
   if UpdateScrollbars(false) then
+  begin
     Include(FPaintFlags, TATEditorInternalFlag.RepaintNeeded);
+    //CudaText #6606: scrollbar was shown/hidden, client area is changed;
+    //refresh the main rects and repair the caret scroll, if the caret line
+    //is now partly cut at the bottom edge
+    GetRectMain(FRectMain);
+    DoCaretsFixIfCutAtBottomEdge;
+  end;
+
+  //CudaText #6608: control's height was decreased (e.g. CudaText plugin shows
+  //its panel at bottom/top of editor), and the caret line, which was visible
+  //before the resize, can be pushed out of the visible area; scroll minimally,
+  //to show the caret line at the bottom edge.
+  //Only for ALineFrom<0: for ALineFrom>=0 the v-scroll-pos is reset from
+  //ALineFrom on the 2nd painting pass, which would cancel this fix.
+  if TATEditorInternalFlag.FixCaretAfterResize in FPaintFlags then
+  begin
+    Exclude(FPaintFlags, TATEditorInternalFlag.FixCaretAfterResize);
+    if ALineFrom<0 then
+      DoCaretsFixIfHiddenAtBottomEdge;
+  end;
 end;
 
 procedure TATSynEdit.DoPaintLockedWarning(C: TCanvas);
@@ -6792,11 +6924,16 @@ begin
 
   if DoubleBuffered then
   //buf mode: timer tick don't give painting of whole bitmap
-  //(cIntFlagBitmap off)
   begin
     if not Assigned(FBitmap) then exit;
-    DoPaintCarets(FBitmap.Canvas, true);
+    //CudaText #6635: blit the clean bitmap, then paint the caret phase
+    //onto the paint-event canvas; FBitmap itself never holds the XOR-ed
+    //caret, so partial repaint passes cannot toggle its content.
+    //AWithInvalidate=false: GTK3 has no "refuse InvalidateRect during
+    //paint" guard like GTK2 (CurrentSentPaintMessageTarget), a queued
+    //caret rect would start a repaint storm, flipping the phase per pass.
     Canvas.Draw(0, 0, FBitmap);
+    DoPaintCarets(Canvas, false);
   end
   else
   //non-buf mode: timer tick clears whole canvas first.
@@ -6817,6 +6954,7 @@ end;
 procedure TATSynEdit.Resize;
 var
   bNeedResetLineTop: boolean;
+  bCaretFixNeeded: boolean;
 begin
   inherited;
   if not IsRepaintEnabled then exit;
@@ -6830,11 +6968,32 @@ begin
     FPaintStarted and //avoid bNeedResetLineTop=True on first showing of 2nd ui-tab in CudaText
     (Height>FLastControlHeight) and
     (FScrollVert.SmoothPos>=FScrollVert.SmoothPosLast);
+
+  //CudaText #6608: height is decreased (e.g. CudaText plugin shows its panel
+  //at bottom/top of editor), and the caret line is visible now: it can be
+  //pushed out of the visible area at the bottom edge, because the v-scroll-pos
+  //was limited for the old bigger height. Remember to fix the scroll after
+  //the next painting.
+  bCaretFixNeeded:=
+    FPaintStarted and
+    (Height<FLastControlHeight) and
+    (Width=FLastControlWidth) and //don't fix it, when wrap-info must be recalculated for new width
+    IsLastCaretVisibleVertically;
+
   FLastControlWidth:= Width;
   FLastControlHeight:= Height;
 
   if bNeedResetLineTop then
     FLineTopTodo:= 0 //fix outdated LineTop after height increased (CudaText #6221)
+  else
+  if bCaretFixNeeded then
+  begin
+    //don't set FLineTopTodo from the current top line: it can be outdated
+    //(limited for the old bigger height), keep the current v-scroll-pos,
+    //DoPaint will fix it for the caret line
+    FLineTopTodo:= 0;
+    Include(FPaintFlags, TATEditorInternalFlag.FixCaretAfterResize);
+  end
   else
     FLineTopTodo:= GetLineTop;
 
@@ -7029,7 +7188,9 @@ begin
   //consider Gaps for vert scrolling
   if bConsiderGaps then
   begin
-    NPos:= Min(AInfo.NPos, AWrapInfo.Count-1);
+    //WrapInfo.Count can be 0 (not calculated yet), Data[] then gives
+    //Default(TATWrapItem): keep NPos>=0 so the walk below stays sane
+    NPos:= Max(0, Min(AInfo.NPos, AWrapInfo.Count-1));
     NPixels:= AInfo.NPixelOffset;
 
     NLineIndex:= AWrapInfo.Data[NPos].NLineIndex - 1;
@@ -7038,8 +7199,15 @@ begin
     repeat
       NPixels:= APos - NPos* AInfo.CharSizeScaled div ATEditorCharXScale
         - NGapsCum;
+      //the walk MUST be allowed to decrement into the 1st line's wrapped
+      //rows: WrapItem.NLineIndex is 0-based, so with NLineIndex=
+      //Data[NPos].NLineIndex-1 here, an "if NLineIndex=0 then Break"
+      //guard fired at the SECOND line, and smooth positions belonging to
+      //the 1st line's wrapped rows / to the gap after the 1st line ended
+      //the walk one line too low, with NEGATIVE NPixels -> negative
+      //NPixelOffset -> GetRectMain() shifts R.Top down -> background
+      //band (white hole) at the editor top, until the next repaint
       if NPos=0 then Break;
-      if NLineIndex=0 then Break;
       if NPixels>=0 then Break;
       Dec(NPos);
       NLineIndex2:= AWrapInfo.Data[NPos].NLineIndex - 1;
@@ -8160,7 +8328,7 @@ begin
           then
           begin
             //remove selection from current caret
-            nIndexCaret:= Carets.IndexOfPosXY(FMouseDownPnt.X, FMouseDownPnt.Y, true);
+            nIndexCaret:= Carets.FindCaretAtPos(FMouseDownPnt.X, FMouseDownPnt.Y, true);
             if Carets.IsIndexValid(nIndexCaret) then
             begin
               Caret:= Carets[nIndexCaret];
@@ -8264,7 +8432,7 @@ begin
             //drag with Ctrl pressed: add selection
             if bSelectAdding then
             begin
-              nIndexCaret:= Carets.IndexOfPosXY(FMouseDownPnt.X, FMouseDownPnt.Y, true);
+              nIndexCaret:= Carets.FindCaretAtPos(FMouseDownPnt.X, FMouseDownPnt.Y, true);
               if Carets.IsIndexValid(nIndexCaret) then
                 Carets[nIndexCaret].SelectToPoint(PntText.X, PntText.Y);
             end;
@@ -8632,25 +8800,33 @@ begin
 end;
 
 procedure TATSynEdit.TimerBlinkTick(Sender: TObject);
-var
-  bFocused: boolean;
 begin
   if not FCaretShowEnabled then exit;
   if not IsLibrary then
     if not Application.Active then exit;
 
-  if FCaretStopUnfocused then
-  begin
-    bFocused:= _IsFocused;
-    if not bFocused then
-      if FCaretShown then
-        exit;
-  end;
+  if FCaretStopUnfocused and FCaretShown then
+    if not _IsFocused then
+      exit;
 
   if not DoubleBuffered then
+  begin
     FCaretAllowNextBlink:= not FCaretAllowNextBlink;
-
-  DoPaintCarets(Canvas, true);
+    DoPaintCarets(Canvas, true);
+  end
+  else
+  begin
+    //CudaText #6635 (GTK3 X11): in buf mode the blink phase must be owned
+    //by this timer only. Painting the caret phase must not depend on how
+    //many LM_PAINT passes GTK3 runs (self-queued invalidations, scrollbar
+    //adjustment updates, X11 exposes): each pass used to XOR the caret
+    //rect again, flipping its visible phase, so the caret flickered with
+    //a period far below OptCaretBlinkTime. Here we only toggle the phase
+    //and damage the caret rects; the next paint pass blits the clean
+    //FBitmap and paints the caret according to FCaretShown.
+    FCaretShown:= not FCaretShown;
+    InvalidateRectsOfCarets;
+  end;
 end;
 
 procedure TATSynEdit.TimerScrollTick(Sender: TObject);
@@ -8697,7 +8873,7 @@ begin
     else
     if IsSelRectEmpty and not FMouseDownAndColumnSelection then
     begin
-      nIndexCaret:= Carets.IndexOfPosXY(FMouseDownPnt.X, FMouseDownPnt.Y, true);
+      nIndexCaret:= Carets.FindCaretAtPos(FMouseDownPnt.X, FMouseDownPnt.Y, true);
       if nIndexCaret>=0 then
         Carets[nIndexCaret].SelectToPoint(PCaret.X, PCaret.Y);
     end
@@ -8807,11 +8983,11 @@ end;
 
 procedure TATSynEdit.DoPaintCarets(C: TCanvas; AWithInvalidate: boolean);
 var
-  Caret: TATCaretItem;
+  Caret, CaretPrev: TATCaretItem;
   CaretShape: TATCaretShape;
   R, RectCaretOld: TRect;
   NCharWidth: integer;
-  iCaret: integer;
+  iCaret, jCaret: integer;
 begin
   if csLoading in ComponentState then exit;
   if csDestroying in ComponentState then exit;
@@ -8820,17 +8996,15 @@ begin
   //disable InvalidateRect during Paint
   if (csCustomPaint in ControlState) then
     AWithInvalidate:= false;
-  //if not IsInvalidateAllowed then
-  //  AWithInvalidate:= false;
 
-  if ModeReadOnly then
-    CaretShape:= FCaretShapeReadonly
-  else
-  if ModeOverwrite then
-    CaretShape:= FCaretShapeOverwrite
-  else
-    CaretShape:= FCaretShapeNormal;
+  CaretShape:= DoCaretGetShape;
 
+  //CudaText #6635: in buf mode the phase is owned by TimerBlinkTick,
+  //paint passes must not toggle it. Non-buf mode keeps the old parity
+  //mechanism (toggle per full pass onto the persistent window surface).
+  if DoubleBuffered then
+    //nothing to toggle
+  else
   if FCaretBlinkEnabled then
     FCaretShown:= not FCaretShown
   else
@@ -8849,11 +9023,9 @@ begin
     if Caret.CoordX+NCharWidth<=FRectMain.Left then Continue;
     if Caret.CoordY+FCharSize.Y<=FRectMain.Top then Continue;
 
-    R.Left:= Caret.CoordX;
-    R.Top:= Caret.CoordY;
-    R.Right:= R.Left+NCharWidth;
-    R.Bottom:= R.Top+FCharSize.Y;
+    R:= DoCaretCalcRect(Caret.CoordX, Caret.CoordY, CaretShape);
 
+    //caret must not show over minimap-tooltip
     if FMinimapTooltipVisible and FMinimapTooltipEnabled and (FRectMinimapTooltip.Width>0) then
       if (R.Left>=FRectMinimapTooltip.Left) and
         (R.Right<=FRectMinimapTooltip.Right) and
@@ -8861,7 +9033,16 @@ begin
         (R.Bottom<=FRectMinimapTooltip.Bottom) then
         Continue;
 
-    DoCaretsApplyShape(R, CaretShape, NCharWidth, FCharSize.Y);
+    //CudaText #6635, buf mode: caret moved since last paint (typing,
+    //scroll) -- show it immediately, restarting the blink phase;
+    //blink phase OFF -- don't paint the caret at all in this pass
+    if DoubleBuffered then
+    begin
+      if FCaretBlinkEnabled and (Caret.OldRect<>R) then
+        FCaretShown:= true;
+      if FCaretBlinkEnabled and (not FCaretShown) then
+        Continue;
+    end;
 
     if FCaretBlinkEnabled then
     begin
@@ -8883,15 +9064,21 @@ begin
           end;
         end;
       end;
-
-      DoPaintCaretShape(C, R, Caret, CaretShape);
-    end
-    else
-    begin
-      DoPaintCaretShape(C, R, Caret, CaretShape);
     end;
 
     Caret.OldRect:= R;
+
+    //when CaretShape's height>100%, and carets are aligned in a column,
+    //adjust R to not overlap the previous caret's rect.
+    if (CaretShape.Height<-100) and (iCaret>0) then
+      for jCaret:= Max(0, iCaret-TATEditorOptions.MaxCaretColumnsAvoidingCoordsOverlap) to iCaret-1 do
+      begin
+        CaretPrev:= Carets[jCaret];
+        if (CaretPrev.CoordX=Caret.CoordX) and (CaretPrev.PosY=Caret.PosY-1) then
+          R.Top:= Max(R.Top, CaretPrev.OldRect.Bottom);
+      end;
+
+    DoPaintCaretShape(C, R, Caret, CaretShape);
 
     if AWithInvalidate then
     begin
@@ -8928,6 +9115,44 @@ begin
   R.Bottom:= R.Top + FCharSize.Y; //100% height
 
   CanvasFillRect(C, R, Colors.DragDropMarker);
+end;
+
+function TATSynEdit.DoCaretGetShape: TATCaretShape;
+begin
+  if ModeReadOnly then
+    Result:= FCaretShapeReadonly
+  else
+  if ModeOverwrite then
+    Result:= FCaretShapeOverwrite
+  else
+    Result:= FCaretShapeNormal;
+end;
+
+procedure TATSynEdit.InvalidateRectsOfCarets;
+//CudaText #6635: damage the rects of all carets, so the next paint pass
+//blits the clean bitmap there and applies the new blink phase
+var
+  Caret: TATCaretItem;
+  CaretShape: TATCaretShape;
+  R: TRect;
+  iCaret: integer;
+begin
+  if not HandleAllocated then exit;
+  CaretShape:= DoCaretGetShape;
+
+  for iCaret:= 0 to FCarets.Count-1 do
+  begin
+    Caret:= FCarets[iCaret];
+    if Caret.CoordX=-1 then Continue;
+    R:= DoCaretCalcRect(Caret.CoordX, Caret.CoordY, CaretShape);
+
+    if R.Left>=FRectMain.Right then Continue;
+    if R.Top>=FRectMain.Bottom then Continue;
+    if R.Right<=FRectMain.Left then Continue;
+    if R.Bottom<=FRectMain.Top then Continue;
+
+    InvalidateRect(Handle, @R, false);
+  end;
 end;
 
 procedure TATSynEdit.TimerBlinkDisable;
@@ -9362,10 +9587,9 @@ begin
   if AToBegin then
     FScrollVert.SetZero
   else
-    FScrollVert.SetLast;
+    FScrollVert.SetLast; //with gaps, the end can be pixels into a gap: keep NPixelOffset from SetLast
 
   FScrollHorz.NPixelOffset:= 0;
-  FScrollVert.NPixelOffset:= 0;
 
   UpdateScrollbars(true);
 end;
@@ -9764,6 +9988,11 @@ procedure TATSynEdit.TimersStart;
 //TimersStart/Stop are added to minimize count of running timers
 begin
   FTimersEnabled:= true;
+  //CudaText #6635: caret must be visible right after the editor gets
+  //focus; in buf mode the phase is owned by the blink timer, so reset
+  //it here instead of relying on the next full paint pass
+  if DoubleBuffered then
+    FCaretShown:= true;
   if Assigned(FTimerBlink) then
     FTimerBlink.Enabled:= FTimersEnabled and FCaretBlinkEnabled;
 end;

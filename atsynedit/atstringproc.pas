@@ -280,7 +280,6 @@ procedure SAddStringToHistory(const S: string; List: TStrings; MaxItems: integer
 
 procedure TrimStringList(L: TStringList); inline;
 
-procedure SReplaceAll(var S: string; const SFrom, STo: string); inline;
 procedure SDeleteFrom(var s: string; const SFrom: string); inline;
 procedure SDeleteFrom(var s: UnicodeString; const SFrom: UnicodeString); inline;
 procedure SDeleteFromEol(var S: string);
@@ -297,8 +296,14 @@ procedure SSplitByChar(const S: string; Sep: char; out S1, S2: string);
 procedure SDeleteAndInsert(var AStr: UnicodeString; AFromPos, ACount: SizeInt; const AReplace: UnicodeString);
 procedure SDeleteHtmlTags(var S: string);
 procedure SFixGreekTextAfterCaseConversion(var S: UnicodeString; ALastCharIsWordEdge: boolean);
+procedure SCompressRepeatingSpacesAndEols(var S: string);
 
 function SCalcHashQword(const S: string): QWord;
+
+type
+  TATSetOfByte = set of byte;
+
+function SUnescapePercentEncodedString(const S: string; const AEncodableChars: TATSetOfByte): string;
 
 
 implementation
@@ -1775,11 +1780,6 @@ begin
 end;
 
 
-procedure SReplaceAll(var S: string; const SFrom, STo: string);
-begin
-  S:= StringReplace(S, SFrom, STo, [rfReplaceAll]);
-end;
-
 procedure SDeleteFrom(var s: string; const SFrom: string);
 var
   n: SizeInt;
@@ -2225,5 +2225,108 @@ begin
   Result:= (H1 xor H2) * 1099511628211;
 end;
 {$pop}
+
+
+procedure SCompressRepeatingSpacesAndEols(var S: string);
+//replace #10 with space, then collapse runs of spaces to single space; single pass
+var
+  NLen, iSrc, iDest: integer;
+  ch: char;
+  bPrevSpace: boolean;
+begin
+  if (Pos(#10, S)=0) and (Pos('  ', S)=0) then exit;
+  NLen:= Length(S);
+  UniqueString(S);
+  iDest:= 0;
+  bPrevSpace:= false;
+  for iSrc:= 1 to NLen do
+  begin
+    ch:= S[iSrc];
+    if ch=#10 then
+      ch:= ' ';
+    if ch=' ' then
+    begin
+      if bPrevSpace then Continue;
+      bPrevSpace:= true;
+    end
+    else
+      bPrevSpace:= false;
+    Inc(iDest);
+    S[iDest]:= ch;
+  end;
+  SetLength(S, iDest);
+end;
+
+
+function SUnescapePercentEncodedString(const S: string; const AEncodableChars: TATSetOfByte): string;
+
+  //decodes 2 uppercase hex digits at APos, true if decoded char is encodable
+  function TryDecodeHexPair(const AStr: string; APos: integer; out ACode: integer): boolean;
+  const
+    cHexDigits: set of byte = [Ord('0')..Ord('9'), Ord('A')..Ord('F')];
+  var
+    N1, N2: integer;
+  begin
+    Result:= false;
+    N1:= Ord(AStr[APos]);
+    N2:= Ord(AStr[APos+1]);
+    if (N1 in cHexDigits) and (N2 in cHexDigits) then
+    begin
+      if N1 <= Ord('9') then
+        Dec(N1, Ord('0'))
+      else
+        Dec(N1, Ord('A') - 10);
+      if N2 <= Ord('9') then
+        Dec(N2, Ord('0'))
+      else
+        Dec(N2, Ord('A') - 10);
+      ACode:= N1 * 16 + N2;
+      Result:= ACode in AEncodableChars;
+    end;
+  end;
+
+var
+  i, j, N, Code: integer;
+begin
+  Result:= S;
+  N:= Length(S);
+  if N < 3 then Exit;
+
+  //find 1st encodable '%XX', to skip entire job for common case
+  i:= 1;
+  while i <= N - 2 do
+  begin
+    if (S[i] = '%') and TryDecodeHexPair(S, i + 1, Code) then
+      Break;
+    Inc(i);
+  end;
+  if i > N - 2 then Exit;
+
+  //replace all encodable pairs, compacting string in Result
+  //(copy-on-write: 1st write gives Result its own buffer, S is not modified):
+  //result is always shorter, so write pos never overtakes read pos
+  j:= i;
+  while i <= N - 2 do
+  begin
+    if (S[i] = '%') and TryDecodeHexPair(S, i + 1, Code) then
+    begin
+      Result[j]:= Chr(Code);
+      Inc(j);
+      Inc(i, 3);
+      Continue;
+    end;
+    Result[j]:= S[i];
+    Inc(i);
+    Inc(j);
+  end;
+  while i <= N do
+  begin
+    Result[j]:= S[i];
+    Inc(i);
+    Inc(j);
+  end;
+  SetLength(Result, j - 1);
+end;
+
 
 end.

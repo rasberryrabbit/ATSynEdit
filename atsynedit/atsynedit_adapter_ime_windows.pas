@@ -196,6 +196,7 @@ begin
   // draw IME Caret
   if CaretVisible then
   begin
+    // fix caret position on Korean IME
     if position=0 then
       position:=1;
     SetLength(s,position);

@@ -1,8 +1,11 @@
 {$ifdef nnnn}begin end;{$endif}
 
 function TATSynEdit.IsLineWithCaret(ALine: integer; ADisableSelected: boolean=false): boolean; inline;
+var
+  N: integer;
 begin
-  Result:= FCarets.IsLineWithCaret(ALine, ADisableSelected);
+  N:= FCarets.FindCaretOnLine(ALine);
+  Result:= (N>=0) and (not ADisableSelected or not FCarets[N].IsSelection);
 end;
 
 function TATSynEdit.IsWrapItemWithCaret(constref AWrapItem: TATWrapItem): boolean;
@@ -61,7 +64,7 @@ procedure TATSynEdit.DoCaretAddToPoint(AX, AY: integer);
 var
   N: integer;
 begin
-  N:= Carets.IndexOfPosXY(AX, AY);
+  N:= Carets.FindCaretAtPos(AX, AY);
   if Carets.IsIndexValid(N) then
   begin
     if Carets.Count>1 then
@@ -105,7 +108,7 @@ begin
     Inc(PCoord1.Y, FCharSize.Y);
     PCaret:= ClientPosToCaretPos(PCoord1, Details);
     if PCaret.Y>=0 then
-      if not Carets.IsLineWithCaret(PCaret.Y) then
+      if Carets.FindCaretOnLine(PCaret.Y)=-1 then
         Carets.Add(PCaret.X, PCaret.Y, -1, -1, false{AWithEvent});
   until PCoord1.Y>=PCoord2.Y;
 
@@ -938,12 +941,21 @@ begin
     NProximityHorz:= 0;
   end;
 
-  //for y
-  if DoCaretApplyProximityToVertEdge(APos, Coord.Y, NProximityVert, AIndentVert) then
+  //for x
+  //must run before the 'for y' block: horz scrolling can show the horz
+  //scrollbar (style=Auto), which shrinks the page height, and the vert
+  //scrolling below must be calculated for the shrunk page (CudaText #6606)
+  if DoCaretApplyProximityToHorzEdge(Coord.X, NProximityHorz, AIndentHorz) then
     Result:= true;
 
-  //for x
-  if DoCaretApplyProximityToHorzEdge(Coord.X, NProximityHorz, AIndentHorz) then
+  //horz scrollbar could be shown/hidden now: refresh the main rects,
+  //so the 'for y' block below uses the exact page height
+  if Result then
+    if UpdateScrollbars(true) then
+      GetRectMain(FRectMain);
+
+  //for y
+  if DoCaretApplyProximityToVertEdge(APos, Coord.Y, NProximityVert, AIndentVert) then
     Result:= true;
 
   if Result then
@@ -1544,28 +1556,40 @@ begin
 end;
 
 
-procedure TATSynEdit.DoCaretsApplyShape(var R: TRect; Props: TATCaretShape; W, H: integer);
+function TATSynEdit.DoCaretCalcRect(ACoordX, ACoordY: integer; AShape: TATCaretShape): TRect;
 var
-  Y0, DY: integer;
+  W, H, Y0, DY: integer;
 begin
-  //width>100% is not needed
-  if Props.Width>=0 then
-    R.Right:= R.Left + Props.Width
-  else
-    R.Right:= R.Left - W * Props.Width div 100;
+  H:= FCharSize.Y;
 
-  if Props.Height>=0 then
-    R.Top:= R.Bottom - Props.Height
+  Result.Left:= ACoordX;
+  Result.Top:= ACoordY;
+  Result.Bottom:= Result.Top+H;
+
+  //width>100% is not needed
+  if AShape.Width>=0 then
+    Result.Right:= Result.Left + AShape.Width
   else
-  if Props.Height<-100 then
   begin
-    Y0:= (R.Top+R.Bottom) div 2;
-    DY:= -H * Props.Height div 200;
-    R.Top:= Y0-DY;
-    R.Bottom:= Y0+DY;
-  end
+    W:= FCharSize.XScaled div ATEditorCharXScale;
+    Result.Right:= Result.Left - W * AShape.Width div 100;
+  end;
+
+  if AShape.Height>=0 then
+    Result.Top:= Result.Bottom - AShape.Height
   else
-    R.Top:= R.Bottom + H * Props.Height div 100;
+  begin
+    //height<-100 means >100%, must be supported
+    if AShape.Height<-100 then
+    begin
+      Y0:= (Result.Top+Result.Bottom) div 2;
+      DY:= -H * AShape.Height div 200;
+      Result.Top:= Y0-DY;
+      Result.Bottom:= Y0+DY;
+    end
+    else
+      Result.Top:= Result.Bottom + H * AShape.Height div 100;
+  end;
 end;
 
 
