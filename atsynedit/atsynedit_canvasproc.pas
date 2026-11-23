@@ -1129,8 +1129,7 @@ begin
   //Default(record) would zero the full fixed arrays (about 48 KB) on every call.
   ListInt.Len:= 0;
   Dx.Len:= 0;
-  //no need to clear DxUTF8
-  FillChar(bPartsSpaces, SizeOf(bPartsSpaces), 0);
+  //no need to clear DxUTF8 or bPartsSpaces; active LineParts are initialized below.
 
   if AProps.SuperFast or (AProps.HasAsciiNoTabs and not ATEditorOptions.TextoutNeedsOffsets) then
   begin
@@ -1216,8 +1215,9 @@ begin
       if PartLen=0 then Break;
       PartOffset:= PartPtr^.Offset;
       if PartOffset>ListInt.Len then Break;
-      if not IsStringSpaces(AText, PartOffset+1, PartLen) then Continue;
-      bPartsSpaces[iPart]:= true;
+      // Initialize only active entries; the fixed array need not be cleared.
+      bPartsSpaces[iPart]:= IsStringSpaces(AText, PartOffset+1, PartLen);
+      if not bPartsSpaces[iPart] then Continue;
 
       if PartOffset>0 then
         PixOffset1:= ListInt.Data[PartOffset-1]
@@ -1255,12 +1255,12 @@ begin
     NLastPart:= 0;
     for iPart:= 0 to High(TATLineParts) do
     begin
-      if bPartsSpaces[iPart] then Continue;
       PartPtr:= @AParts^[iPart];
       PartLen:= PartPtr^.Len;
       if PartLen=0 then Break;
       PartOffset:= PartPtr^.Offset;
       if PartOffset>ListInt.Len then Break;
+      if bPartsSpaces[iPart] then Continue;
       PartStr:= Copy(AText, PartOffset+1, PartLen);
       if PartStr='' then Break;
       NLastPart:= iPart;
